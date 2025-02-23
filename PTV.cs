@@ -4,6 +4,7 @@ using HarmonyLib;
 using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
+using Unity.Netcode;
 using UnityEngine;
 using UnityEngine.Video;
 
@@ -16,147 +17,292 @@ namespace PTV {
 
         private readonly Harmony harmony = new Harmony(modGUID);
         public static ManualLogSource logger = new ManualLogSource(modGUID);
+        public static GameObject networkPrefab;
 
         void Awake() {
+            NetcodePatcher();
+
             logger = Logger; // if this line doesn't exist the game crashes
 
-            VideoManager.Load();
+            string assetPath = Path.Combine(Path.GetDirectoryName(Info.Location), "asset");
+            AssetBundle bundle = AssetBundle.LoadFromFile(assetPath);
+
+            networkPrefab = bundle.LoadAsset<GameObject>("Assets/NetworkHandler.prefab");
+            networkPrefab.AddComponent<NetworkHandler>();
+            VideoManager.Load(Path.GetDirectoryName(Info.Location));
             harmony.PatchAll();
             logger.LogInfo($"{modName} version {modVersion} has loaded!");
+        }
+
+        private static void NetcodePatcher() {
+            var types = Assembly.GetExecutingAssembly().GetTypes();
+
+            foreach (var type in types) {
+                var methods = type.GetMethods(BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static);
+
+                foreach (var method in methods) {
+                    var attributes = method.GetCustomAttributes(typeof(RuntimeInitializeOnLoadMethodAttribute), false);
+
+                    if (attributes.Length > 0) method.Invoke(null, null);
+                }
+            }
         }
     }
 
     [HarmonyPatch(typeof(TVScript))]
     internal static class TVScriptPatch {
-        private static FieldInfo currentClipProperty = typeof(TVScript).GetField("currentClip", BindingFlags.NonPublic | BindingFlags.Instance);
-        private static FieldInfo currentTimeProperty = typeof(TVScript).GetField("currentClipTime", BindingFlags.NonPublic | BindingFlags.Instance);
         private static MethodInfo setMatMethod = typeof(TVScript).GetMethod("SetTVScreenMaterial", BindingFlags.NonPublic | BindingFlags.Instance);
         private static MethodInfo onEnableMethod = typeof(TVScript).GetMethod("OnEnable", BindingFlags.NonPublic | BindingFlags.Instance);
 
-        private static bool firstPlay = true;
+        private static TVScript tv;
         private static RenderTexture renderTexture;
-        private static VideoPlayer currentVP;
-        private static VideoPlayer nextVP;
+        private static VideoPlayer currentVP, nextVP;
+        private static int currentIndex = -1, nextIndex = 0;
+        private static double forceTime = -1;
 
-        [HarmonyPrefix]
-        [HarmonyPatch("Update")]
+        [HarmonyPrefix, HarmonyPatch("Update")]
         public static bool Update(TVScript __instance) {
+            tv = __instance;
+
             if (currentVP != null) return false;
 
-            currentVP = __instance.GetComponent<VideoPlayer>();
+            currentVP = tv.GetComponent<VideoPlayer>();
             renderTexture = currentVP.targetTexture;
 
             if (VideoManager.Videos.Count < 1) return false;
-
-            VideoManager.Videos.Shuffle();
-            PrepareVideo(__instance, 0);
+            if (!NetworkHandler.Hosting()) return false;
+            
+            TurnTVOnOff(tv, false);
+            VideoManager.ShuffledVideos = new List<string>(VideoManager.Videos);
+            VideoManager.Shuffle();
+            PrepareNextVideo(tv);
 
             return false;
         }
 
-        [HarmonyPrefix]
-        [HarmonyPatch("TurnTVOnOff")]
+        [HarmonyPrefix, HarmonyPatch("TurnTVOnOff")]
         public static bool TurnTVOnOff(TVScript __instance, bool on) {
-            if (VideoManager.Videos.Count < 1) return false;
-            if (on && !firstPlay) currentClipProperty.SetValue(__instance, NextIndex((int)currentClipProperty.GetValue(__instance)));
+            tv = __instance;
 
-            __instance.tvOn = on;
+            if (VideoManager.Videos.Count < 1) return false;
+
+            tv.tvOn = on;
 
             if (on) {
-                PlayVideo(__instance);
-                __instance.tvSFX.PlayOneShot(__instance.switchTVOn);
-                WalkieTalkie.TransmitOneShotAudio(__instance.tvSFX, __instance.switchTVOn);
+                PlayNextVideo();
+                tv.tvSFX.PlayOneShot(tv.switchTVOn);
+                WalkieTalkie.TransmitOneShotAudio(tv.tvSFX, tv.switchTVOn);
             }
             else {
-                __instance.video.Stop();
-                __instance.tvSFX.PlayOneShot(__instance.switchTVOff);
-                WalkieTalkie.TransmitOneShotAudio(__instance.tvSFX, __instance.switchTVOff);
+                tv.video.Stop();
+                tv.tvSFX.PlayOneShot(tv.switchTVOff);
+                WalkieTalkie.TransmitOneShotAudio(tv.tvSFX, tv.switchTVOff);
             }
 
-            setMatMethod.Invoke(__instance, new object[] { on });
+            setMatMethod.Invoke(tv, new object[] { on });
+
             return false;
         }
 
-        [HarmonyPrefix]
-        [HarmonyPatch("TVFinishedClip")]
+        [HarmonyPrefix, HarmonyPatch("TVFinishedClip")]
         public static bool TVFinishedClip(TVScript __instance, VideoPlayer source) {
-            currentTimeProperty.SetValue(__instance, 0f);
-            currentClipProperty.SetValue(__instance, NextIndex((int)currentClipProperty.GetValue(__instance)));
-            PlayVideo(__instance);
+            tv = __instance;
+
+            PlayNextVideo();
 
             return false;
         }
 
-        private static void PrepareVideo(TVScript tv, int index = -1) {
-            if (index == -1) index = NextIndex((int)currentClipProperty.GetValue(tv));
+        private static void PrepareNextVideo(TVScript tv) {
             if (nextVP != null && nextVP.gameObject.activeInHierarchy) GameObject.Destroy(nextVP);
 
             nextVP = tv.gameObject.AddComponent<VideoPlayer>();
             nextVP.playOnAwake = false;
-            //nextVP.isLooping = true;
             nextVP.source = VideoSource.Url;
             nextVP.controlledAudioTrackCount = 1;
             nextVP.audioOutputMode = VideoAudioOutputMode.AudioSource;
             nextVP.SetTargetAudioSource(0, tv.tvSFX);
-            nextVP.url = $"file://{VideoManager.Videos[index]}";
             nextVP.skipOnDrop = true;
+
+            if (NetworkHandler.Hosting()) nextVP.url = $"file://{VideoManager.ShuffledVideos[nextIndex]}";
+            else nextVP.url = $"file://{VideoManager.Videos[nextIndex]}";
+
             nextVP.Prepare();
         }
 
-        private static void PlayVideo(TVScript tv) {
-            firstPlay = false;
+        private static void PlayNextVideo(int index = -1) {
+            if (nextVP == null) return;
 
-            if (VideoManager.Videos.Count < 1) return;
+            VideoPlayer temp = currentVP;
 
-            if (nextVP != null) {
-                var temp = currentVP;
+            tv.video = currentVP = nextVP;
+            nextVP = null;
+            GameObject.Destroy(temp);
+            onEnableMethod.Invoke(tv, new object[] { });
+            currentIndex = nextIndex;
 
-                tv.video = currentVP = nextVP;
-                nextVP = null;
-                GameObject.Destroy(temp);
-                onEnableMethod.Invoke(tv, new object[] { });
-            }
+            if (NetworkHandler.Hosting()) nextIndex = VideoManager.NextIndex(currentIndex);
+            else if (index != -1) nextIndex = index;
 
-            currentTimeProperty.SetValue(tv, 0f);
+            if (NetworkHandler.Hosting()) UpdateInfo();
+
             tv.video.targetTexture = renderTexture;
             tv.video.Play();
-            PrepareVideo(tv);
-            PTV.logger.LogInfo("Playing video");
+            PrepareNextVideo(tv);
         }
 
-        private static int NextIndex(int index) {
-            if (index + 1 >= VideoManager.Videos.Count) VideoManager.Videos.Shuffle();
-
-            return (index + 1) % VideoManager.Videos.Count;
+        [HarmonyPostfix, HarmonyPatch(typeof(NetworkManager), nameof(NetworkManager.SetSingleton))]
+        public static void Init() {
+            NetworkManager.Singleton.OnClientConnectedCallback += ClientConnected;
         }
 
-        private static void Shuffle<T>(this IList<T> list) {
-            int n = list.Count;
-
-            while (n > 1) {
-                n--;
-
-                int k = Random.Range(0, n + 1);
-                T value = list[k];
-
-                list[k] = list[n];
-                list[n] = value;
+        static void ClientConnected(ulong id) {
+            if (NetworkHandler.Hosting() && id != NetworkManager.ServerClientId) {
+                if (tv.tvOn) UpdateInfo(1);
+                else UpdateInfo(0);
             }
+        }
+
+        private static void ForceTime(VideoPlayer source) {
+            if (forceTime == -1) return;
+
+            source.time = forceTime;
+            source.prepareCompleted -= ForceTime;
+            forceTime = -1;
+        }
+
+        public static void RecievedInfo(int current, double time, int next, int tvOn) {
+            if (NetworkHandler.Hosting()) return;
+            if (tvOn == 0) TurnTVOnOff(tv, false);
+            else if (tvOn == 1) {
+                nextIndex = current;
+                PrepareNextVideo(tv);
+                TurnTVOnOff(tv, true);
+            }
+
+            if (currentIndex != current) {
+                if (tv.tvOn) {
+                    nextIndex = current;
+                    PrepareNextVideo(tv);
+                    PlayNextVideo(next);
+                }
+                else {
+                    currentIndex = current;
+                    nextIndex = next;
+                    PrepareNextVideo(tv);
+                }
+            }
+            else if (nextIndex != next) {
+                nextIndex = next;
+                PrepareNextVideo(tv);
+            }
+
+            double timeDifference = time - currentVP.time; // made variable in case i want to use it for smoother syncing
+
+            if (Mathf.Abs((float) timeDifference) >= 1) {
+                forceTime = time;
+                currentVP.prepareCompleted += ForceTime;
+            }
+        }
+
+        private static void UpdateInfo(int tvOn = -1) {
+            NetworkHandler.instance.UpdateInfoClientRpc(VideoManager.GetTrueIndex(currentIndex), currentVP.time, VideoManager.GetTrueIndex(nextIndex), tvOn);
         }
     }
 
     internal static class VideoManager {
         public static List<string> Videos = new List<string>();
+        public static List<string> ShuffledVideos;
 
-        public static void Load() {
-            string myPath = Path.Combine(Paths.PluginPath, "Gavinboy3000-PTV");
+        public static void Load(string basePath) {
+            string videosPath = Path.Combine(basePath, "Videos");
 
-            if (!Directory.Exists(myPath)) return;
+            if (!Directory.Exists(basePath)) return;
 
-            var videoFiles = Directory.GetFiles(myPath, "*.mp4");
+            string[] videoFiles;
 
+            if (!Directory.Exists(videosPath)) {
+                videoFiles = Directory.GetFiles(basePath, "*.mp4");
+
+                if (videoFiles.Length < 1) return;
+
+                Directory.CreateDirectory(videosPath);
+
+                for (int i = 0; i < videoFiles.Length; i++) {
+                    string destFile = Path.Combine(videosPath, Path.GetFileName(videoFiles[i]));
+
+                    File.Move(videoFiles[i], destFile);
+                }
+            }
+
+            videoFiles = Directory.GetFiles(videosPath, "*.mp4");
             Videos.AddRange(videoFiles);
             PTV.logger.LogInfo($"Successfully loaded {Videos.Count} videos!");
+        }
+
+        public static void Shuffle() {
+            int n = ShuffledVideos.Count;
+
+            while (n > 1) {
+                n--;
+
+                int k = Random.Range(0, n + 1); // UnityEngine
+                string value = ShuffledVideos[k];
+
+                ShuffledVideos[k] = ShuffledVideos[n];
+                ShuffledVideos[n] = value;
+            }
+        }
+        public  static int GetTrueIndex(int index) {
+            if (index < 0) index = 0;
+
+            int trueIndex = Videos.IndexOf(ShuffledVideos[index]);
+
+            if (trueIndex == -1) return index;
+
+            return trueIndex;
+        }
+
+
+        public static int NextIndex(int index) {
+            if (index + 1 >= VideoManager.Videos.Count) Shuffle();
+
+            return (index + 1) % VideoManager.Videos.Count;
+        }
+    }
+
+    [HarmonyPatch]
+    public class NetworkObjectManager {
+        [HarmonyPostfix, HarmonyPatch(typeof(GameNetworkManager), "Start")]
+        static void Init(GameNetworkManager __instance) {
+            __instance.GetComponent<NetworkManager>().AddNetworkPrefab(PTV.networkPrefab);
+        }
+
+        [HarmonyPostfix, HarmonyPatch(typeof(StartOfRound), "Awake")]
+        static void SpawnNetworkHandler() {
+            if (NetworkHandler.Hosting()) {
+                GameObject networkHandlerHost = GameObject.Instantiate(PTV.networkPrefab);
+
+                networkHandlerHost.GetComponent<NetworkObject>().Spawn();
+            }
+        }
+    }
+
+    public class NetworkHandler : NetworkBehaviour {
+        public static NetworkHandler instance;
+
+        public static bool Hosting() {
+            return NetworkManager.Singleton.IsHost || NetworkManager.Singleton.IsServer;
+        }
+
+        public override void OnNetworkSpawn() {
+            instance = this;
+            base.OnNetworkSpawn();
+        }
+
+        [ClientRpc]
+        public void UpdateInfoClientRpc(int current, double time, int next, int tvOn) {
+            TVScriptPatch.RecievedInfo(current, time, next, tvOn);
         }
     }
 }
