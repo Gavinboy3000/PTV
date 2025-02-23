@@ -1,8 +1,11 @@
 ﻿using BepInEx;
+using BepInEx.Configuration;
 using BepInEx.Logging;
 using HarmonyLib;
+using HarmonyLib.Tools;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Reflection;
 using Unity.Netcode;
 using UnityEngine;
@@ -15,11 +18,17 @@ namespace PTV {
         public const string modName = "PTV";
         public const string modVersion = "1.0.0.0";
 
+        public static ConfigEntry<bool> configBeginWithIntro;
+        public static ConfigEntry<bool> configTVInShop;
+
         private readonly Harmony harmony = new Harmony(modGUID);
         public static ManualLogSource logger = new ManualLogSource(modGUID);
         public static GameObject networkPrefab;
 
         void Awake() {
+            configBeginWithIntro = Config.Bind("Misc", "Begin With Intro", true, "Puts main intro at the beginning of every shuffle.");
+            configTVInShop = Config.Bind("QOL", "TV in Shop", true, "Makes it so the television is always in the shop.");
+
             NetcodePatcher();
 
             logger = Logger; // if this line doesn't exist the game crashes
@@ -75,6 +84,8 @@ namespace PTV {
             TurnTVOnOff(tv, false);
             VideoManager.ShuffledVideos = new List<string>(VideoManager.Videos);
             VideoManager.Shuffle();
+            currentIndex = -1;
+            nextIndex = 0;
             PrepareNextVideo(tv);
 
             return false;
@@ -111,6 +122,28 @@ namespace PTV {
             PlayNextVideo();
 
             return false;
+        }
+
+        [HarmonyPostfix, HarmonyPatch(typeof(Terminal), nameof(Terminal.RotateShipDecorSelection))]
+        public static void AddTV(Terminal __instance) {
+            if (!PTV.configTVInShop.Value) return;
+
+            int index = -1;
+
+            for (int i = 0; i < StartOfRound.Instance.unlockablesList.unlockables.Count; i++) {
+                if (StartOfRound.Instance.unlockablesList.unlockables[i].unlockableName == "Television") {
+                    index = i;
+                    break;
+                }
+            }
+
+            if (index == -1) return;
+
+            TerminalNode itemNode = StartOfRound.Instance.unlockablesList.unlockables[index].shopSelectionNode;
+
+            if (__instance.ShipDecorSelection.Contains(itemNode)) return;
+
+            __instance.ShipDecorSelection.Add(itemNode);
         }
 
         private static void PrepareNextVideo(TVScript tv) {
@@ -252,6 +285,18 @@ namespace PTV {
                 ShuffledVideos[k] = ShuffledVideos[n];
                 ShuffledVideos[n] = value;
             }
+
+            if (!PTV.configBeginWithIntro.Value) return;
+
+            string introPath = Path.Combine(Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location), "Videos", "MainIntro.mp4");
+            int introIndex = ShuffledVideos.IndexOf(introPath);
+
+            if (introIndex == -1) return;
+
+            string temp = ShuffledVideos[0];
+
+            ShuffledVideos[0] = introPath;
+            ShuffledVideos[introIndex] = temp;
         }
         public  static int GetTrueIndex(int index) {
             if (index < 0) index = 0;
