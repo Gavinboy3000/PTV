@@ -1,0 +1,9 @@
+{
+    "name": "PTV",
+    "version_number": "1.0.0",
+    "website_url": "https://github.com/Gavinboy3000/PTV",
+    "description": "Makes the television play Family Guy funny moments.",
+    "dependencies": [
+        "BepInEx-BepInExPack-5.4.2100"
+    ]
+}

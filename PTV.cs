@@ -16,7 +16,7 @@ namespace PTV {
     public class PTV : BaseUnityPlugin {
         public const string modGUID = "Gavinboy3000.PTV";
         public const string modName = "PTV";
-        public const string modVersion = "1.0.0.0";
+        public const string modVersion = "1.0.0";
 
         public static ConfigEntry<bool> configBeginWithIntro;
         public static ConfigEntry<bool> configTVInShop;
