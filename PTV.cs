@@ -16,7 +16,7 @@ namespace PTV {
     public class PTV : BaseUnityPlugin {
         public const string modGUID = "Gavinboy3000.PTV";
         public const string modName = "PTV";
-        public const string modVersion = "1.0.0";
+        public const string modVersion = "1.0.1";
 
         public static ConfigEntry<bool> configBeginWithIntro;
         public static ConfigEntry<bool> configTVInShop;
@@ -68,6 +68,7 @@ namespace PTV {
         private static VideoPlayer currentVP, nextVP;
         private static int currentIndex = -1, nextIndex = 0;
         private static double forceTime = -1;
+        private static bool tvExists = true;
 
         [HarmonyPrefix, HarmonyPatch("Update")]
         public static bool Update(TVScript __instance) {
@@ -79,7 +80,16 @@ namespace PTV {
             renderTexture = currentVP.targetTexture;
 
             if (VideoManager.Videos.Count < 1) return false;
-            if (!NetworkHandler.Hosting()) return false;
+            if (!NetworkHandler.Hosting()) {
+                if (!tvExists) {
+                    tvExists = true;
+                    TurnTVOnOff(tv, false);
+                }
+
+                PrepareNextVideo(tv);
+
+                return false;
+            }
             
             TurnTVOnOff(tv, false);
             VideoManager.ShuffledVideos = new List<string>(VideoManager.Videos);
@@ -122,6 +132,13 @@ namespace PTV {
             PlayNextVideo();
 
             return false;
+        }
+
+        [HarmonyPostfix, HarmonyPatch(typeof(TVScript), "OnDisable")]
+        public static void TVDisabled() {
+            if (NetworkHandler.Hosting()) return;
+
+            tvExists = false;
         }
 
         [HarmonyPostfix, HarmonyPatch(typeof(Terminal), nameof(Terminal.RotateShipDecorSelection))]
@@ -191,8 +208,13 @@ namespace PTV {
 
         static void ClientConnected(ulong id) {
             if (NetworkHandler.Hosting() && id != NetworkManager.ServerClientId) {
-                if (tv.tvOn) UpdateInfo(1);
-                else UpdateInfo(0);
+                if (tv != null) {
+                    if (tv.tvOn) UpdateInfo(1);
+                    else UpdateInfo(0);
+                }
+                else {
+                    UpdateInfo(0);
+                }
             }
         }
 
@@ -206,6 +228,13 @@ namespace PTV {
 
         public static void RecievedInfo(int current, double time, int next, int tvOn) {
             if (NetworkHandler.Hosting()) return;
+            if (tv == null) {
+                tvExists = false;
+                currentIndex = current;
+                nextIndex = next;
+                return;
+            }
+
             if (tvOn == 0) TurnTVOnOff(tv, false);
             else if (tvOn == 1) {
                 nextIndex = current;
@@ -239,7 +268,11 @@ namespace PTV {
         }
 
         private static void UpdateInfo(int tvOn = -1) {
-            NetworkHandler.instance.UpdateInfoClientRpc(VideoManager.GetTrueIndex(currentIndex), currentVP.time, VideoManager.GetTrueIndex(nextIndex), tvOn);
+            double time = 0;
+
+            if (currentVP) time = currentVP.time;
+
+            NetworkHandler.instance.UpdateInfoClientRpc(VideoManager.GetTrueIndex(currentIndex), time, VideoManager.GetTrueIndex(nextIndex), tvOn);
         }
     }
 
@@ -299,6 +332,7 @@ namespace PTV {
             ShuffledVideos[introIndex] = temp;
         }
         public  static int GetTrueIndex(int index) {
+            if (ShuffledVideos == null) return 0;
             if (index < 0) index = 0;
 
             int trueIndex = Videos.IndexOf(ShuffledVideos[index]);
